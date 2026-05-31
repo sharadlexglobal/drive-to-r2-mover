@@ -77,11 +77,11 @@ def run_transfer():
         "gdrive:", f"r2:{R2_BUCKET}/",
         "--config", RCLONE_CONF,
         "--drive-root-folder-id", DRIVE_FOLDER_ID,
-        "--transfers", "16",
-        "--checkers", "16",
+        "--transfers", "4",
+        "--checkers", "8",
         "--drive-acknowledge-abuse",
-        "--s3-upload-concurrency", "8",
-        "--s3-chunk-size", "128M",
+        "--s3-upload-concurrency", "4",
+        "--s3-chunk-size", "32M",
         "--fast-list",
         "--stats", "20s",
         "--stats-one-line",
@@ -122,9 +122,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    httpd = socketserver.ThreadingTCPServer(("0.0.0.0", PORT), Handler)
     threading.Thread(target=run_transfer, daemon=True).start()
-    with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), Handler) as httpd:
+    try:
         httpd.serve_forever()
+    finally:
+        httpd.server_close()
 
 
 if __name__ == "__main__":

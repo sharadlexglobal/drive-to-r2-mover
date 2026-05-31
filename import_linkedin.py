@@ -189,40 +189,51 @@ def run_import():
             if chunk_n >= CHUNK_ROWS:
                 t0 = time.time()
                 payload = buf.getvalue()
+
+                def get_writable_conn():
+                    for attempt in range(1, 100):
+                        try:
+                            c = psycopg2.connect(**PG)
+                            c.autocommit = False
+                            cu = c.cursor()
+                            cu.execute("SET statement_timeout = 0")
+                            cu.execute("SET idle_in_transaction_session_timeout = 0")
+                            cu.execute("SHOW transaction_read_only")
+                            ro = cu.fetchone()[0]
+                            if ro == "on":
+                                print(f"  conn attempt {attempt}: replica (read-only), retry", flush=True)
+                                try: c.close()
+                                except Exception: pass
+                                time.sleep(0.5 + 0.2 * attempt)
+                                continue
+                            return c, cu
+                        except Exception as e:
+                            print(f"  conn attempt {attempt} failed: {type(e).__name__}: {str(e)[:120]}", flush=True)
+                            time.sleep(0.5 + 0.2 * attempt)
+                    raise RuntimeError("could not get writable connection after 100 attempts")
+
                 ok = False
-                for attempt in range(1, 6):
+                for attempt in range(1, 50):
                     try:
                         cur.copy_expert(copy_sql, io.StringIO(payload))
                         conn.commit()
                         ok = True
                         break
-                    except psycopg2.errors.ReadOnlySqlTransaction as e:
+                    except (psycopg2.errors.ReadOnlySqlTransaction,
+                            psycopg2.errors.OperationalError,
+                            psycopg2.InterfaceError) as e:
+                        state["last_error"] = f"retry {attempt}: {type(e).__name__}"
                         try: conn.rollback()
                         except Exception: pass
                         try: conn.close()
                         except Exception: pass
-                        state["last_error"] = f"READONLY retry {attempt}: reconnecting"
-                        print(state["last_error"], flush=True)
-                        time.sleep(1.5 * attempt)
-                        conn = psycopg2.connect(**PG)
-                        conn.autocommit = False
-                        cur = conn.cursor()
-                        cur.execute("SET statement_timeout = 0")
-                        cur.execute("SET idle_in_transaction_session_timeout = 0")
+                        conn, cur = get_writable_conn()
                     except Exception as e:
+                        state["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+                        print(f"CHUNK NON-RETRY FAIL: {state['last_error']}", flush=True)
                         try: conn.rollback()
                         except Exception: pass
-                        state["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
-                        print(f"CHUNK FAIL (attempt {attempt}): {state['last_error']}", flush=True)
-                        time.sleep(1.5 * attempt)
-                        try:
-                            conn.close()
-                        except Exception: pass
-                        conn = psycopg2.connect(**PG)
-                        conn.autocommit = False
-                        cur = conn.cursor()
-                        cur.execute("SET statement_timeout = 0")
-                        cur.execute("SET idle_in_transaction_session_timeout = 0")
+                        break
                 if ok:
                     state["rows_loaded"] += chunk_n
                     dt = time.time() - t0

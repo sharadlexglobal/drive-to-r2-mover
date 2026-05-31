@@ -188,10 +188,42 @@ def run_import():
 
             if chunk_n >= CHUNK_ROWS:
                 t0 = time.time()
-                buf.seek(0)
-                try:
-                    cur.copy_expert(copy_sql, buf)
-                    conn.commit()
+                payload = buf.getvalue()
+                ok = False
+                for attempt in range(1, 6):
+                    try:
+                        cur.copy_expert(copy_sql, io.StringIO(payload))
+                        conn.commit()
+                        ok = True
+                        break
+                    except psycopg2.errors.ReadOnlySqlTransaction as e:
+                        try: conn.rollback()
+                        except Exception: pass
+                        try: conn.close()
+                        except Exception: pass
+                        state["last_error"] = f"READONLY retry {attempt}: reconnecting"
+                        print(state["last_error"], flush=True)
+                        time.sleep(1.5 * attempt)
+                        conn = psycopg2.connect(**PG)
+                        conn.autocommit = False
+                        cur = conn.cursor()
+                        cur.execute("SET statement_timeout = 0")
+                        cur.execute("SET idle_in_transaction_session_timeout = 0")
+                    except Exception as e:
+                        try: conn.rollback()
+                        except Exception: pass
+                        state["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+                        print(f"CHUNK FAIL (attempt {attempt}): {state['last_error']}", flush=True)
+                        time.sleep(1.5 * attempt)
+                        try:
+                            conn.close()
+                        except Exception: pass
+                        conn = psycopg2.connect(**PG)
+                        conn.autocommit = False
+                        cur = conn.cursor()
+                        cur.execute("SET statement_timeout = 0")
+                        cur.execute("SET idle_in_transaction_session_timeout = 0")
+                if ok:
                     state["rows_loaded"] += chunk_n
                     dt = time.time() - t0
                     state["last_chunk_rate"] = chunk_n / dt if dt > 0 else 0
@@ -199,14 +231,16 @@ def run_import():
                     state["last_update"] = time.time()
                     print(f"+{chunk_n:,} rows in {dt:.1f}s ({state['last_chunk_rate']:,.0f}/s) | "
                           f"total {state['rows_loaded']:,} ({state['avg_rate']:,.0f}/s avg)", flush=True)
-                    cur.execute("UPDATE import_progress SET rows_loaded=%s, last_update=NOW() WHERE source=%s",
-                                (state["rows_loaded"], CSV_PATH))
-                    conn.commit()
-                except Exception as e:
-                    conn.rollback()
+                    try:
+                        cur.execute("UPDATE import_progress SET rows_loaded=%s, last_update=NOW() WHERE source=%s",
+                                    (state["rows_loaded"], CSV_PATH))
+                        conn.commit()
+                    except Exception:
+                        try: conn.rollback()
+                        except Exception: pass
+                else:
                     state["rows_skipped"] += chunk_n
-                    state["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
-                    print(f"CHUNK FAIL: {state['last_error']}", flush=True)
+                    print(f"CHUNK LOST after 5 attempts: {chunk_n} rows", flush=True)
                 buf = io.StringIO()
                 chunk_n = 0
 

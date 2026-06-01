@@ -93,8 +93,9 @@ state = {
     "avg_rate": 0, "last_error": None,
 }
 
-INDIA_RE = re.compile(r"\bindia\b", re.IGNORECASE)
-EXCLUDE_RE = re.compile(r"indianapolis|indian ocean|indian wells|indianola", re.IGNORECASE)
+NAME_INDIA_RE = re.compile(r"\b(india|indian)\b", re.IGNORECASE)
+DESC_INDIA_RE = re.compile(r"\b(india|indian|bharat|hindustan)\b", re.IGNORECASE)
+EXCLUDE_RE = re.compile(r"indianapolis|indian ocean|indian wells|indianola|indian wells", re.IGNORECASE)
 
 
 class S3RangeReader(io.RawIOBase):
@@ -140,13 +141,32 @@ def get_writable_conn():
     raise RuntimeError("no writable conn")
 
 
-def is_india(loc):
-    if not loc: return False
-    if EXCLUDE_RE.search(loc):
-        # Could have both — only skip if doesn't ALSO have a clear India match
-        if not INDIA_RE.search(re.sub(EXCLUDE_RE, '', loc)):
-            return False
-    return bool(INDIA_RE.search(loc))
+def is_india(row, idx_phone, idx_web, idx_name, idx_desc, idx_loc):
+    # Signal 1: phone starts with +91
+    if idx_phone >= 0 and idx_phone < len(row):
+        p = row[idx_phone] or ""
+        if p.startswith("+91"): return True
+    # Signal 2: website .in TLD (strict — must be .in domain, not .india.com etc)
+    if idx_web >= 0 and idx_web < len(row):
+        w = (row[idx_web] or "").lower().rstrip("/")
+        # extract domain
+        m = re.match(r"https?://([^/]+)", w)
+        if m:
+            dom = m.group(1)
+            if dom.endswith(".in") or dom.endswith(".co.in") or dom.endswith(".net.in") or dom.endswith(".org.in"):
+                return True
+    # Signal 3: company name contains "India" word
+    if idx_name >= 0 and idx_name < len(row):
+        n = row[idx_name] or ""
+        if NAME_INDIA_RE.search(n) and not EXCLUDE_RE.search(n):
+            return True
+    # Signal 4: description mentions india AND location is APAC
+    if idx_desc >= 0 and idx_loc >= 0 and idx_desc < len(row) and idx_loc < len(row):
+        d = row[idx_desc] or ""
+        l = row[idx_loc] or ""
+        if DESC_INDIA_RE.search(d) and not EXCLUDE_RE.search(d) and "APAC" in l:
+            return True
+    return False
 
 
 def run_import():
@@ -213,13 +233,15 @@ def run_import():
                         if dest_name:
                             src_to_dest[src_idx] = DEST_COLS.index(dest_name)
                     loc_idx = header.index("locations") if "locations" in header else -1
+                    phone_idx = header.index("phone_number") if "phone_number" in header else -1
+                    web_idx = header.index("website") if "website" in header else -1
+                    name_idx = header.index("name") if "name" in header else -1
+                    desc_idx = header.index("short_description") if "short_description" in header else -1
                     N_DEST = len(DEST_COLS)
 
                     for row in reader:
                         state["rows_scanned"] += 1
-                        if loc_idx < 0 or loc_idx >= len(row):
-                            continue
-                        if not is_india(row[loc_idx]):
+                        if not is_india(row, phone_idx, web_idx, name_idx, desc_idx, loc_idx):
                             continue
                         out = [""] * N_DEST
                         for src_idx, dest_idx in src_to_dest.items():
